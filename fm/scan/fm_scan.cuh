@@ -8,8 +8,7 @@
 #define CHECK_STRIDE(x) TORCH_CHECK(x.stride(-1) == 1 || x.size(-1) == 1);
 
 template <typename weight_t, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence, 
-          int size_B, int size_M, int size_D, int size_L,
-          bool reverse, bool backward>
+          int size_L, bool reverse, bool backward>
 __global__ void fm_scan(
     const weight_t* __restrict__ gates,   // [B, M, L]
     const weight_t* __restrict__ tokens,  // Forward: [B, D, L], Backward: [B, M, D, L]
@@ -17,7 +16,8 @@ __global__ void fm_scan(
     weight_t* __restrict__ result,        // [B, M, D, L]
     // Backward
     const weight_t* __restrict__ cached_output,  // [B, M, D, L]
-    weight_t* __restrict__ gateGradOut    // [B, M, L]
+    weight_t* __restrict__ gateGradOut,    // [B, M, D, L] keep D dim to avoid atomicAdd for now
+    int size_B, int size_M, int size_D
 ) {
     __shared__ weight_t warpLastGate[kNWarpsPerBlock];
     __shared__ weight_t warpLastToken[kNWarpsPerBlock];
@@ -161,7 +161,10 @@ __global__ void fm_scan(
             // gate_idx doesn't depend on  blockIdx.z, so entire z index will sequentially sum here.
             // The operation will sequentially sum D times.
             // may or may not be an issue, further profiling is needed
-            atomicAdd(&gateGradOut[gate_idx], contribution);
+            // atomicAdd(&gateGradOut[gate_idx], contribution);
+            
+            // store the full [B, M, D, L] tensor to avoid atomicAdd
+            gateGradOut[result_idx] = contribution;
         }
 
         // Update chunk accumulators
@@ -173,6 +176,21 @@ __global__ void fm_scan(
         __syncthreads();
     }
 }
+
+#define DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, seqlen, grid, stream, gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward) \
+    constexpr int kNWarpsPerBlock = seqlen <= 1024 ? seqlen / 32 : 32; \
+    constexpr int kNChunksPerSequence = seqlen <= 1024 ? 1 : seqlen / 1024; \
+    constexpr int kNThreads = seqlen / kNChunksPerSequence;\
+    fm_scan<weight_t, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, \
+            seqlen, reverse, backward><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
+        reinterpret_cast<const weight_t *>(gates.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<const weight_t *>(tokens.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<const weight_t *>(initial_state.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<weight_t *>(out.data_ptr<torch_weight_t>()), \
+        reinterpret_cast<const weight_t *>(cached_output), \
+        reinterpret_cast<weight_t *>(gateGradOut), \
+        size_B, size_M, size_D \
+        );
 
 // working on adapting the following macros
 template <typename weight_t, typename torch_weight_t>
@@ -201,28 +219,62 @@ fmscan_launch(
     dim3 grid(size_B, size_M, size_D);
     constexpr int kNThreadsPerWarp = 32;
 
-    int kNWarpsPerBlock = 1;
-    int kNChunksPerSequence = 1;
-
-    if (seqlen>=32 && seqlen <=1024)
-    {   
-        kNWarpsPerBlock = seqlen / 32; // 32 threads per warp
+    if (seqlen == 32) {
+        constexpr int _seqlen = 32;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen = 64) {
+        constexpr int _seqlen = 64;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 128) {
+        constexpr int _seqlen = 128;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 256) {
+        constexpr int _seqlen = 256;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 512) {
+        constexpr int _seqlen = 512;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 1024) {
+        constexpr int _seqlen = 1024;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 2048) {
+        constexpr int _seqlen = 2048;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 4096) {
+        constexpr int _seqlen = 4096;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 8192) {
+        constexpr int _seqlen = 8192;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 16384) {
+        constexpr int _seqlen = 16384;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 32768) {
+        constexpr int _seqlen = 32768;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 65536) {
+        constexpr int _seqlen = 65536;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
+    } else if (seqlen == 131072) {
+        constexpr int _seqlen = 131072;
+        DISPATCH_FMSCAN(weight_t, kNThreadsPerWarp, _seqlen, grid, stream, 
+                        gates, tokens, out, initial_state, output, gateGradOut, size_B, size_M, size_D, reverse, backward)
     } else {
-        kNWarpsPerBlock = 32;
-        kNChunksPerSequence = seqlen / 1024;
+        // raise error
+        TORCH_CHECK(false,  "seqlen must be a power of 2, >= 32, <= 131072");
     }
-    int kNThreads = seqlen / kNChunksPerSequence;
-
-    fm_scan<weight_t, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, 
-            size_B, size_M, size_D, seqlen, 
-            reverse, backward><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( 
-        reinterpret_cast<const weight_t *>(gates.data_ptr<torch_weight_t>()), 
-        reinterpret_cast<const weight_t *>(tokens.data_ptr<torch_weight_t>()), 
-        reinterpret_cast<const weight_t *>(initial_state.data_ptr<torch_weight_t>()), 
-        reinterpret_cast<weight_t *>(out.data_ptr<torch_weight_t>()), 
-        reinterpret_cast<const weight_t *>(cached_output), 
-        reinterpret_cast<weight_t *>(gateGradOut) 
-        );
 }
 
 #define DISPATCH_FMSCAN(gates, ...) \
