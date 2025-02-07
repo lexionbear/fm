@@ -1,4 +1,4 @@
-// leverage similar algorithm as https://github.com/proger/accelerated-scan
+// inspired by the algorithm as https://github.com/proger/accelerated-scan
 #include <cuda.h>
 #include <cuda_runtime.h>
 
