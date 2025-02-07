@@ -99,13 +99,19 @@ def fm_memory(alpha, update_scale, output_scale, inputs, initial_state=None, mem
         update_scale: (B, L, 1)
         output_scale: (B, L, 1)
         tokens: (B, L, D)
+
+        initial_state: (B, M, D)
+        memor_norm: bool
+        norm_eps: float
+        
+        return: (B, D, L)
     '''
 
     # (B, L, M) * (B, L, D) -> (B, M, D, L) use einops
-    update_weight = alpha *  update_scale
+    update_weight = alpha * update_scale
     tokens = torch.einsum('blm,bld->bmdl', update_weight, inputs).contiguous()
     update_weight = update_weight.transpose(1, 2) # (B, M, L)
-    decay_weight = 1 - update_weight
+    decay_weight = 1.0 - update_weight
     decay_weight.contiguous()
 
     memory_states = fm_scan(decay_weight, tokens, initial_state) # (B, M, D, L)
