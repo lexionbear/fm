@@ -73,8 +73,10 @@ __global__ void fm_scan(
             gate = gates[gate_idx];
         }
 
-        // Load token
-        weight_t token = tokens[token_idx];
+        // Load token 
+        // Token = update weight * inputs
+        // update_weight = 1 - gate 
+        weight_t token =  backward ? tokens[token_idx] : tokens[token_idx] * (1.0 - gate);
 
         // Initialize accumulators
         weight_t accToken, accGate;
