@@ -7,6 +7,38 @@
 
 #define CHECK_STRIDE(x) TORCH_CHECK(x.stride(-1) == 1 || x.size(-1) == 1);
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <type_traits>  // For std::is_same
+
+template <typename weight_t>
+__device__ float cast_to_float(weight_t value) {
+    if constexpr (std::is_same<weight_t, float>::value) {
+        return value;
+    } else if constexpr (std::is_same<weight_t, __half>::value) {
+        return __half2float(value);
+    } else if constexpr (std::is_same<weight_t, __nv_bfloat16>::value) {
+        return __bfloat162float(value);
+    } else {
+        // Handle other types or static_assert if needed
+        static_assert(sizeof(weight_t) == 0, "Unsupported type");
+    }
+}
+
+template <typename weight_t>
+__device__ weight_t cast_from_float(float value) {
+    if constexpr (std::is_same<weight_t, float>::value) {
+        return value;
+    } else if constexpr (std::is_same<weight_t, __half>::value) {
+        return __float2half(value);
+    } else if constexpr (std::is_same<weight_t, __nv_bfloat16>::value) {
+        return __float2bfloat16(value);
+    } else {
+        // Handle other types or static_assert if needed
+        static_assert(sizeof(weight_t) == 0, "Unsupported type");
+    }
+}
+
 template <typename weight_t, int kNThreadsPerWarp, int kNWarpsPerBlock, int kNChunksPerSequence, 
           int size_L, bool reverse, bool backward>
 __global__ void fm_scan(
@@ -22,10 +54,10 @@ __global__ void fm_scan(
     // Dimensions
     int size_B, int size_M, int size_D
 ) {
-    __shared__ weight_t warpLastGate[kNWarpsPerBlock];
-    __shared__ weight_t warpLastToken[kNWarpsPerBlock];
-    __shared__ weight_t chunkAccGate;
-    __shared__ weight_t chunkAccToken;
+    __shared__ float warpLastGate[kNWarpsPerBlock];
+    __shared__ float warpLastToken[kNWarpsPerBlock];
+    __shared__ float chunkAccGate;
+    __shared__ float chunkAccToken;
 
     const int batch_idx = blockIdx.x;
     const int m_idx = blockIdx.y;
@@ -38,7 +70,7 @@ __global__ void fm_scan(
     const int chunklen = blockDim.x;  // Threads per chunk (blockDim.x)
     constexpr int kBlockLast = kNWarpsPerBlock - 1;
     constexpr int kWarpLast = kNThreadsPerWarp - 1;
-    const weight_t kEmptyGate = 1.0;
+    const float kEmptyGate = 1.0;
 
     // Offsets
     const int gate_offset = batch_idx * size_M * size_L + m_idx * size_L;
@@ -67,26 +99,26 @@ __global__ void fm_scan(
         if (chunk != 0) __syncthreads();
 
         // Load gate
-        weight_t gate;
+        float gate;
         if (reverse) {
             if (chunk == 0 && tid == 0) {
                 gate = kEmptyGate;
             } else {
-                gate = gates[gate_idx + 1];
+                gate =  cast_to_float<weight_t>(gates[gate_idx + 1]);
             }
         } else {
-            gate = gates[gate_idx];
+            gate = cast_to_float<weight_t>(gates[gate_idx]);
         }
 
         // Load token 
         // Token = update weight * inputs
         // update_weight = 1 - gate 
-        weight_t token =  backward ? tokens[token_idx] : tokens[token_idx] * (static_cast<weight_t>(1.0) - gate);
+        float token = backward ? cast_to_float<weight_t>(tokens[token_idx]) : cast_to_float<weight_t>(tokens[token_idx]) * (1.0 - gate);
 
         // Initialize accumulators
-        weight_t accToken, accGate;
+        float accToken, accGate;
         if (chunk == 0 && tid == 0) {
-            accToken = initial_state[initial_state_offset] * gate + token;
+            accToken = cast_to_float<weight_t>(initial_state[initial_state_offset]) * gate + token;
             accGate = gate;
         } else {
             if (tid == 0) {
@@ -100,8 +132,8 @@ __global__ void fm_scan(
 
         // Warp-level scan
         for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-            weight_t prev_gate = __shfl_up_sync(0xffffffff, accGate, delta);
-            weight_t prev_token = __shfl_up_sync(0xffffffff, accToken, delta);
+            float prev_gate = __shfl_up_sync(0xffffffff, accGate, delta);
+            float prev_token = __shfl_up_sync(0xffffffff, accToken, delta);
 
             if (laneId >= delta) {
                 accToken = prev_token * accGate + accToken;
@@ -121,12 +153,12 @@ __global__ void fm_scan(
 
         // Block-level scan
         if (warpId == 0) {
-            weight_t warpAccGate = (laneId < kNWarpsPerBlock) ? warpLastGate[laneId] : kEmptyGate;
-            weight_t warpAccToken = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : static_cast<weight_t>(0.0);
+            float warpAccGate = (laneId < kNWarpsPerBlock) ? warpLastGate[laneId] : kEmptyGate;
+            float warpAccToken = (laneId < kNWarpsPerBlock) ? warpLastToken[laneId] : 0.0;
 
             for (int delta = 1; delta < kNThreadsPerWarp; delta *= 2) {
-                weight_t prev_gate = __shfl_up_sync(0xffffffff, warpAccGate, delta);
-                weight_t prev_token = __shfl_up_sync(0xffffffff, warpAccToken, delta);
+                float prev_gate = __shfl_up_sync(0xffffffff, warpAccGate, delta);
+                float prev_token = __shfl_up_sync(0xffffffff, warpAccToken, delta);
 
                 if (laneId >= delta) {
                     warpAccToken = prev_token * warpAccGate + warpAccToken;
@@ -149,21 +181,22 @@ __global__ void fm_scan(
         }
 
         // Store result
-        result[result_idx] = backward ? accToken * (static_cast<weight_t>(1.0) - gates[gate_idx]) : accToken;
+        result[result_idx] = cast_from_float<weight_t>(backward ? 
+                            accToken * (1.0 - cast_to_float<weight_t>(gates[gate_idx])) : accToken);
 
         // Backward pass: compute gate gradients
         if (backward) {
             int previous_l = seq_pos - 1;
-            weight_t prev_h;
+            float prev_h;
 
             if (previous_l >= 0 && previous_l < size_L) {
                 int cached_idx = result_offset + previous_l;
-                prev_h = cached_output[cached_idx];
+                prev_h = cast_to_float<weight_t>(cached_output[cached_idx]);
             } else {
-                prev_h = initial_state[initial_state_offset];
+                prev_h = cast_to_float<weight_t>(initial_state[initial_state_offset]);
             }
 
-            weight_t contribution = (prev_h - input_tokens[input_token_offset + seq_pos]) * accToken;
+            float contribution = (prev_h - cast_to_float<weight_t>(input_tokens[input_token_offset + seq_pos])) * accToken;
             // TODO protentially use reduce sum by writing to external memory buffer. D is usually 1024 to 4096
             // gate_idx doesn't depend on  blockIdx.z, so entire z index will sequentially sum here.
             // The operation will sequentially sum D times.
@@ -171,7 +204,7 @@ __global__ void fm_scan(
             // atomicAdd(&gateGradOut[gate_idx], contribution);
             
             // store the full [B, M, D, L] tensor to avoid atomicAdd
-            gateGradOut[result_idx] = contribution;
+            gateGradOut[result_idx] = cast_from_float<weight_t>(contribution);
         }
 
         // Update chunk accumulators
@@ -190,7 +223,7 @@ __global__ void fm_scan(
     constexpr int kNChunksPerSequence = seqlen <= 1024 ? 1 : seqlen / 1024; \
     constexpr int kNThreads = seqlen / kNChunksPerSequence; \
     fm_scan<weight_t, kNThreadsPerWarp, kNWarpsPerBlock, kNChunksPerSequence, \
-            seqlen, reverse, backward><<<grid, kNThreads, kNWarpsPerBlock * sizeof(weight_t) * 2, stream>>>( \
+            seqlen, reverse, backward><<<grid, kNThreads, kNWarpsPerBlock * sizeof(float) * 2, stream>>>( \
         reinterpret_cast<const weight_t *>(gates.data_ptr<torch_weight_t>()), \
         reinterpret_cast<const weight_t *>(tokens.data_ptr<torch_weight_t>()), \
         reinterpret_cast<const weight_t *>(initial_state.data_ptr<torch_weight_t>()), \
